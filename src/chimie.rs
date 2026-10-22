@@ -62,6 +62,7 @@ impl Espece {
         Espece::CO2Gaz,
     ];
 
+    #[inline]
     pub fn index(&self) -> usize {
         *self as usize
     }

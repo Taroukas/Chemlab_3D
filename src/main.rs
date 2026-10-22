@@ -11,15 +11,17 @@ use egui::{Align2, Color32, FontId, Margin, Pos2, RichText, Rounding, Stroke, Te
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use chimie::{CategorieCatalogue, Espece, IndicateurPH, CATALOGUE_REACTIFS};
-use physique::{MoteurPhysique, Vec3};
+use physique::{MoteurPhysique, Vec3, MAX_PARTICULES};
 use solveur::EtatThermochimique;
+
+const MAX_POINTS_GRAPHE: usize = 2500;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1420.0, 840.0])
-            .with_min_inner_size([1300.0, 750.0])
-            .with_title("ChemLab Studio 3D — True 3D Molecular Meshes & Chemical Catalog"),
+            .with_min_inner_size([1280.0, 720.0])
+            .with_title("ChemLab Studio 3D — Interactive 3D Molecular Reactor & Chemical Catalog"),
         ..Default::default()
     };
     eframe::run_native(
@@ -79,6 +81,7 @@ impl Default for Camera3D {
 }
 
 impl Camera3D {
+    #[inline]
     fn vers_espace_camera(&self, p: Vec3) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
@@ -91,6 +94,7 @@ impl Camera3D {
         Vec3::new(x1, y2, z2)
     }
 
+    #[inline]
     fn projeter_cam(&self, p_cam: Vec3, centre_ecran: Pos2, echelle_base: f32) -> Pos2 {
         let distance_cam = 3.6_f32;
         let z_profondeur = (distance_cam - p_cam.z).max(0.35);
@@ -101,6 +105,7 @@ impl Camera3D {
         Pos2::new(sx, sy_screen)
     }
 
+    #[inline]
     fn projeter(&self, p: Vec3, centre_ecran: Pos2, echelle_base: f32) -> (Pos2, f32) {
         let p_cam = self.vers_espace_camera(p);
         (self.projeter_cam(p_cam, centre_ecran, echelle_base), p_cam.z)
@@ -113,10 +118,12 @@ enum Element3D {
 }
 
 impl Element3D {
+    #[inline]
     fn z_cle(&self) -> f32 {
         match self {
             Element3D::Atome { centre_cam, .. } => centre_cam.z,
-            Element3D::Liaison { a_cam, b_cam, .. } => (a_cam.z + b_cam.z) * 0.5,
+            // Slight negative Z bias so bonds always tuck cleanly behind connected atom surfaces
+            Element3D::Liaison { a_cam, b_cam, .. } => (a_cam.z + b_cam.z) * 0.5 - 0.008,
         }
     }
 }
@@ -301,12 +308,14 @@ struct LaboratoireChimie {
     en_pause: bool,
     zoom_interactif_graphes: bool,
     temps: f64,
+    timer_echantillon: f32,
     angle_apercu_3d: f32,
     statut_export: String,
     hist_especes: Vec<Vec<[f64; 2]>>,
     hist_ph: Vec<[f64; 2]>,
     hist_cond: Vec<[f64; 2]>,
     hist_temp: Vec<[f64; 2]>,
+    hist_vol: Vec<f32>,
 }
 
 impl Default for LaboratoireChimie {
@@ -325,12 +334,14 @@ impl Default for LaboratoireChimie {
             en_pause: false,
             zoom_interactif_graphes: false,
             temps: 0.0,
+            timer_echantillon: 0.0,
             angle_apercu_3d: 0.0,
             statut_export: String::new(),
-            hist_especes: vec![Vec::new(); 20],
-            hist_ph: Vec::new(),
-            hist_cond: Vec::new(),
-            hist_temp: Vec::new(),
+            hist_especes: vec![Vec::with_capacity(MAX_POINTS_GRAPHE); 20],
+            hist_ph: Vec::with_capacity(MAX_POINTS_GRAPHE),
+            hist_cond: Vec::with_capacity(MAX_POINTS_GRAPHE),
+            hist_temp: Vec::with_capacity(MAX_POINTS_GRAPHE),
+            hist_vol: Vec::with_capacity(MAX_POINTS_GRAPHE),
         }
     }
 }
@@ -370,16 +381,33 @@ impl LaboratoireChimie {
 
     fn exporter_csv(&mut self) {
         let chemin = "chemlab_3d_results.csv";
-        if let Ok(mut f) = File::create(chemin) {
-            let _ = writeln!(f, "Time_s,pH,Temperature_C,Conductivity_mS_cm");
-            for idx in 0..self.hist_ph.len() {
-                let t = self.hist_ph[idx][0];
-                let ph = self.hist_ph[idx][1];
-                let temp = self.hist_temp.get(idx).map(|x| x[1]).unwrap_or(25.0);
-                let cond = self.hist_cond.get(idx).map(|x| x[1]).unwrap_or(0.0);
-                let _ = writeln!(f, "{:.3},{:.3},{:.3},{:.3}", t, ph, temp, cond);
+        match File::create(chemin) {
+            Ok(mut f) => {
+                let mut entete = String::from("Time_s,Volume_mL,pH,Temperature_C,Conductivity_mS_cm");
+                for esp in Espece::TOUTES {
+                    entete.push_str(&format!(",{}_mmol", esp.symbole().replace(' ', "_")));
+                }
+                let _ = writeln!(f, "{}", entete);
+
+                for idx in 0..self.hist_ph.len() {
+                    let t = self.hist_ph[idx][0];
+                    let vol = self.hist_vol.get(idx).copied().unwrap_or(150.0);
+                    let ph = self.hist_ph[idx][1];
+                    let temp = self.hist_temp.get(idx).map(|x| x[1]).unwrap_or(25.0);
+                    let cond = self.hist_cond.get(idx).map(|x| x[1]).unwrap_or(0.0);
+
+                    let mut ligne = format!("{:.3},{:.1},{:.3},{:.3},{:.3}", t, vol, ph, temp, cond);
+                    for esp in Espece::TOUTES {
+                        let q = self.hist_especes[esp.index()].get(idx).map(|x| x[1]).unwrap_or(0.0);
+                        ligne.push_str(&format!(",{:.2}", q));
+                    }
+                    let _ = writeln!(f, "{}", ligne);
+                }
+                self.statut_export = format!("Saved {} rows to {}", self.hist_ph.len(), chemin);
             }
-            self.statut_export = format!("Saved to {}", chemin);
+            Err(e) => {
+                self.statut_export = format!("Export Error: {}", e);
+            }
         }
     }
 }
@@ -508,8 +536,8 @@ fn ajouter_molecule_vsepr_3d(
             let vec_liaison = cam_i.sub(cam0);
             let dist = vec_liaison.length_sq().sqrt().max(1e-5);
             let dir = vec_liaison.scale(1.0 / dist);
-            let debut = cam0.add(dir.scale(r0 * 0.72));
-            let fin = cam_i.sub(dir.scale(r_i * 0.72));
+            let debut = cam0.add(dir.scale(r0 * 0.70));
+            let fin = cam_i.sub(dir.scale(r_i * 0.70));
 
             elements.push(Element3D::Liaison {
                 a_cam: debut,
@@ -533,6 +561,15 @@ impl eframe::App for LaboratoireChimie {
         let dt = ctx.input(|i| i.stable_dt).min(0.04);
         self.angle_apercu_3d = (self.angle_apercu_3d + 1.15 * dt) % std::f32::consts::TAU;
 
+        // Global Keyboard Shortcuts: F11 (Fullscreen) and Space (Pause/Resume)
+        let plein_ecran_actuel = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!plein_ecran_actuel));
+        }
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.en_pause = !self.en_pause;
+        }
+
         if self.camera.auto_rotate {
             self.camera.yaw = (self.camera.yaw + 0.35 * dt) % std::f32::consts::TAU;
         }
@@ -545,10 +582,31 @@ impl eframe::App for LaboratoireChimie {
                 self.thermo.mmol_par_particule,
             );
             let compteurs = self.physique.compter_especes();
-            self.thermo.mettre_a_jour_rk4(dt as f64, chaleur_j, &compteurs);
+            self.thermo.mettre_a_jour_rk4(
+                dt as f64,
+                self.physique.volume_ml,
+                chaleur_j,
+                &compteurs,
+            );
 
-            if !self.physique.particules.is_empty() {
+            // Throttled 10 Hz telemetry recording with rolling cap (prevents memory growth)
+            self.timer_echantillon += dt;
+            if !self.physique.particules.is_empty() && self.timer_echantillon >= 0.08 {
+                self.timer_echantillon = 0.0;
                 let f = self.thermo.mmol_par_particule;
+
+                if self.hist_ph.len() >= MAX_POINTS_GRAPHE {
+                    self.hist_ph.remove(0);
+                    self.hist_cond.remove(0);
+                    self.hist_temp.remove(0);
+                    self.hist_vol.remove(0);
+                    for v in &mut self.hist_especes {
+                        if !v.is_empty() {
+                            v.remove(0);
+                        }
+                    }
+                }
+
                 for esp in Espece::TOUTES {
                     let idx = esp.index();
                     self.hist_especes[idx].push([self.temps, compteurs[idx] as f64 * f]);
@@ -556,9 +614,11 @@ impl eframe::App for LaboratoireChimie {
                 self.hist_ph.push([self.temps, self.thermo.ph]);
                 self.hist_cond.push([self.temps, self.thermo.conductivite_ms_cm]);
                 self.hist_temp.push([self.temps, self.thermo.temperature_c]);
+                self.hist_vol.push(self.physique.volume_ml);
             }
         }
 
+        // ==================== TOP BAR (WITH FULLSCREEN BUTTON) ====================
         egui::TopBottomPanel::top("top_bar")
             .exact_height(46.0)
             .show(ctx, |ui| {
@@ -571,7 +631,7 @@ impl eframe::App for LaboratoireChimie {
                     );
                     ui.separator();
 
-                    ui.label(RichText::new("Quick 3D Presets:").color(Color32::from_rgb(170, 185, 205)));
+                    ui.label(RichText::new("Quick Presets:").color(Color32::from_rgb(170, 185, 205)));
                     if ui.button("1. Acid-Base Titration").clicked() {
                         self.charger_preset(1);
                     }
@@ -586,13 +646,31 @@ impl eframe::App for LaboratoireChimie {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Fullscreen Toggle Button (F11)
+                        let txt_fs = if plein_ecran_actuel {
+                            "Exit Fullscreen (F11)"
+                        } else {
+                            "Fullscreen (F11)"
+                        };
+                        let col_fs = if plein_ecran_actuel {
+                            Color32::from_rgb(75, 55, 135)
+                        } else {
+                            Color32::from_rgb(38, 52, 78)
+                        };
+                        if ui
+                            .add(egui::Button::new(RichText::new(txt_fs).strong()).fill(col_fs))
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!plein_ecran_actuel));
+                        }
+
                         if ui.button("Export CSV").clicked() {
                             self.exporter_csv();
                         }
                         if ui.button("Reset Reactor").clicked() {
                             *self = Self::default();
                         }
-                        let txt_pause = if self.en_pause { "Resume" } else { "Pause" };
+                        let txt_pause = if self.en_pause { "Resume (Space)" } else { "Pause (Space)" };
                         let col_pause = if self.en_pause {
                             Color32::from_rgb(40, 140, 80)
                         } else {
@@ -608,6 +686,7 @@ impl eframe::App for LaboratoireChimie {
                 });
             });
 
+        // ==================== LEFT PANEL : CHEMICAL CATALOG & SMOOTH 3D PREVIEW ====================
         egui::SidePanel::left("left_catalog_v3")
             .resizable(false)
             .exact_width(355.0)
@@ -634,6 +713,9 @@ impl eframe::App for LaboratoireChimie {
                         ui.horizontal(|ui| {
                             ui.label("Search:");
                             ui.text_edit_singleline(&mut self.recherche_catalogue);
+                            if !self.recherche_catalogue.is_empty() && ui.small_button("Clear").clicked() {
+                                self.recherche_catalogue.clear();
+                            }
                         });
 
                         ui.add_space(4.0);
@@ -697,7 +779,7 @@ impl eframe::App for LaboratoireChimie {
 
                         ui.horizontal(|ui| {
                             let (rect_prev, _) = ui.allocate_exact_size(Vec2::new(86.0, 78.0), egui::Sense::hover());
-                            let painter_p = ui.painter_at(rect_prev);
+                            let painter_p = ui.painter().with_clip_rect(rect_prev);
                             painter_p.rect_filled(rect_prev, Rounding::same(6.0), Color32::from_rgb(11, 15, 22));
                             painter_p.rect_stroke(rect_prev, Rounding::same(6.0), Stroke::new(1.0, Color32::from_rgb(45, 60, 85)));
 
@@ -789,6 +871,16 @@ impl eframe::App for LaboratoireChimie {
                             ui.separator();
                             ui.label(format!("Vol: {:.0} mL", self.physique.volume_ml));
                         });
+                        ui.label(
+                            RichText::new(format!(
+                                "3D Molecules: {} / {}  |  Q = {:.0} J",
+                                self.physique.particules.len(),
+                                MAX_PARTICULES,
+                                self.thermo.enthalpie_cumulee_j
+                            ))
+                                .size(11.0)
+                                .color(Color32::from_rgb(155, 175, 200)),
+                        );
 
                         ui.separator();
                         for esp in Espece::TOUTES {
@@ -808,14 +900,14 @@ impl eframe::App for LaboratoireChimie {
                 });
             });
 
-        // ==================== RIGHT PANEL : FORCED FLEXIBLE WIDTH TO PREVENT OVERLAP ====================
+        // ==================== RIGHT PANEL : ANALYTICAL CURVES ====================
         egui::SidePanel::right("right_analytics_v4")
             .resizable(true)
             .default_width(430.0)
-            .width_range(380.0..=500.0)
+            .width_range(380.0..=520.0)
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .inner_margin(Margin { left: 10.0, right: 10.0, top: 6.0, bottom: 6.0 })
+                    .inner_margin(Margin { left: 12.0, right: 10.0, top: 6.0, bottom: 6.0 })
                     .show(ui, |ui| {
                         let largeur_graphe = (ui.available_width() - 6.0).max(300.0);
                         ui.set_max_width(largeur_graphe);
@@ -940,7 +1032,6 @@ impl eframe::App for LaboratoireChimie {
             ui.separator();
 
             let (rect_dispo, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-            // Clip strict pour empêcher tout débordement graphique sur les panneaux adjacents
             let painter = ui.painter().with_clip_rect(rect_dispo);
 
             if response.dragged_by(egui::PointerButton::Primary) {
@@ -1010,8 +1101,9 @@ impl eframe::App for LaboratoireChimie {
                 b_liq,
             );
 
-            let mut elements = Vec::with_capacity(self.physique.particules.len() * 10 + 4);
+            let mut elements = Vec::with_capacity(self.physique.particules.len() * 10 + 8);
 
+            // 3D Magnetic stir bar capsule
             let l_barreau = 0.22_f32;
             let r_barreau = 0.032_f32;
             let bx = l_barreau * self.physique.angle_barreau.cos();
@@ -1028,6 +1120,30 @@ impl eframe::App for LaboratoireChimie {
             });
             elements.push(Element3D::Atome { centre_cam: b_a, rayon_monde: r_barreau, couleur: blanc_teflon });
             elements.push(Element3D::Atome { centre_cam: b_b, rayon_monde: r_barreau, couleur: blanc_teflon });
+
+            // 3D Burette Nozzle & 3D Falling Droplet when active
+            if self.physique.burette_active {
+                let col_verre_burette = Color32::from_rgb(195, 215, 235);
+                let b_top = self.camera.vers_espace_camera(Vec3::new(0.0, y_haut + 0.42, 0.0));
+                let b_tip = self.camera.vers_espace_camera(Vec3::new(0.0, y_haut + 0.06, 0.0));
+                elements.push(Element3D::Liaison {
+                    a_cam: b_top,
+                    b_cam: b_tip,
+                    rayon_monde: 0.022,
+                    couleur_a: col_verre_burette,
+                    couleur_b: col_verre_burette,
+                });
+
+                let frac_chute = (self.physique.timer_goutte / 0.18).clamp(0.0, 1.0);
+                let y_goutte = (y_haut + 0.04) * (1.0 - frac_chute) + y_surface * frac_chute;
+                let col_goutte = CATALOGUE_REACTIFS[self.physique.index_catalogue_burette].ions[0].0.couleur();
+                let c_goutte = self.camera.vers_espace_camera(Vec3::new(0.0, y_goutte, 0.0));
+                elements.push(Element3D::Atome {
+                    centre_cam: c_goutte,
+                    rayon_monde: 0.026,
+                    couleur: col_goutte,
+                });
+            }
 
             let facteur_echelle = self.echelle_taille_molecules;
             for p in &self.physique.particules {
@@ -1083,7 +1199,7 @@ impl eframe::App for LaboratoireChimie {
             painter.text(
                 Pos2::new(rect_dispo.left() + 14.0, rect_dispo.bottom() - 14.0),
                 Align2::LEFT_BOTTOM,
-                "Controls: Left-Drag = Orbit 3D | Scroll Wheel = True 3D Zoom | Right-Drag = Pan",
+                "Controls: Left-Drag = Orbit 3D | Scroll = True 3D Zoom | Right-Drag = Pan | F11 = Fullscreen | Space = Pause",
                 FontId::proportional(11.5),
                 Color32::from_rgb(145, 165, 195),
             );

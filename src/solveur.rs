@@ -14,7 +14,7 @@ pub struct EtatThermochimique {
 impl Default for EtatThermochimique {
     fn default() -> Self {
         Self {
-            volume_litres: 0.25,
+            volume_litres: 0.15,
             mmol_par_particule: 0.50,
             temperature_c: 25.0,
             temp_ambiante_c: 25.0,
@@ -30,12 +30,16 @@ impl EtatThermochimique {
     pub fn mettre_a_jour_rk4(
         &mut self,
         dt: f64,
+        volume_ml: f32,
         chaleur_reaction_joules: f64,
         compteurs: &[usize; 20],
     ) {
+        // Synchronize actual solution volume (L) with physical beaker level
+        self.volume_litres = ((volume_ml as f64) / 1000.0).clamp(0.05, 0.30);
         self.enthalpie_cumulee_j += chaleur_reaction_joules;
 
-        let c_p_effectif = 120.0;
+        // 1. Volume-scaled heat capacity & RK4 thermal integration
+        let c_p_effectif = 80.0 + 260.0 * self.volume_litres;
         let coeff_pertes_h = 4.5;
         let q_point_reac = chaleur_reaction_joules / dt.max(1e-5);
 
@@ -52,6 +56,7 @@ impl EtatThermochimique {
 
         self.temperature_c = (t0 + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)).clamp(0.0, 100.0);
 
+        // 2. True diluted molar concentrations [C_i] in mol/L
         let facteur_mol_l = (self.mmol_par_particule * 1e-3) / self.volume_litres;
         let c_h = compteurs[Espece::HPlus.index()] as f64 * facteur_mol_l;
         let c_oh = compteurs[Espece::OHMoins.index()] as f64 * facteur_mol_l;
@@ -59,6 +64,7 @@ impl EtatThermochimique {
         let c_co3 = compteurs[Espece::CO3DeuxMoins.index()] as f64 * facteur_mol_l;
         let c_fe = compteurs[Espece::Fe3Plus.index()] as f64 * facteur_mol_l;
 
+        // 3. Smooth sigmoidal pH calculation
         let bilan_protons = c_h + 0.04 * c_fe - (c_oh + 0.15 * c_co3 + 0.12 * c_nh3);
         let echelle = 0.008;
         let ph_cible = (7.0 - 2.6 * (bilan_protons / echelle).sinh().asinh()).clamp(0.4, 13.8);
@@ -66,6 +72,7 @@ impl EtatThermochimique {
         self.ph += (ph_cible - self.ph) * (6.0 * dt).min(1.0);
         self.ph = self.ph.clamp(0.0, 14.0);
 
+        // 4. Kohlrausch ionic conductivity (mS/cm)
         let mut sigma_cible = 0.08;
         for esp in Espece::TOUTES {
             let c_i = compteurs[esp.index()] as f64 * facteur_mol_l;

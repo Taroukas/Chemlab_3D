@@ -1,6 +1,8 @@
 use rand::Rng;
 use crate::chimie::{evaluer_reaction, Espece, Phase, CATALOGUE_REACTIFS};
 
+pub const MAX_PARTICULES: usize = 2400;
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Vec3 {
     pub x: f32,
@@ -13,26 +15,32 @@ impl Vec3 {
         Self { x, y, z }
     }
 
+    #[inline]
     pub fn add(self, o: Self) -> Self {
         Self::new(self.x + o.x, self.y + o.y, self.z + o.z)
     }
 
+    #[inline]
     pub fn sub(self, o: Self) -> Self {
         Self::new(self.x - o.x, self.y - o.y, self.z - o.z)
     }
 
+    #[inline]
     pub fn scale(self, s: f32) -> Self {
         Self::new(self.x * s, self.y * s, self.z * s)
     }
 
+    #[inline]
     pub fn dot(self, o: Self) -> f32 {
         self.x * o.x + self.y * o.y + self.z * o.z
     }
 
+    #[inline]
     pub fn length_sq(self) -> f32 {
         self.x * self.x + self.y * self.y + self.z * self.z
     }
 
+    #[inline]
     pub fn normalize(self) -> Self {
         let l = self.length_sq().sqrt().max(1e-6);
         self.scale(1.0 / l)
@@ -109,7 +117,7 @@ pub struct MoteurPhysique {
 impl Default for MoteurPhysique {
     fn default() -> Self {
         Self {
-            particules: Vec::with_capacity(2000),
+            particules: Vec::with_capacity(MAX_PARTICULES),
             grille: GrilleSpatiale3D::new(14),
             rpm_agitateur: 420.0,
             angle_barreau: 0.0,
@@ -130,9 +138,15 @@ impl MoteurPhysique {
     }
 
     pub fn verser_espece(&mut self, espece: Espece, quantite: usize, goutte_centree: bool) {
+        if self.particules.len() >= MAX_PARTICULES {
+            return;
+        }
+        let dispo = MAX_PARTICULES - self.particules.len();
+        let n_ajout = quantite.min(dispo);
+
         let mut rng = rand::thread_rng();
         let y_surf = self.y_surface_liquide();
-        for _ in 0..quantite {
+        for _ in 0..n_ajout {
             let (r_min, r_max, y_min, y_max) = if goutte_centree {
                 (0.02, 0.22, y_surf - 0.12, y_surf - 0.02)
             } else {
@@ -156,6 +170,9 @@ impl MoteurPhysique {
     }
 
     pub fn verser_reactif_catalogue(&mut self, index_cat: usize, facteur_dose: usize, goutte_centree: bool) {
+        if self.particules.len() >= MAX_PARTICULES {
+            return;
+        }
         if let Some(reac) = CATALOGUE_REACTIFS.get(index_cat) {
             let ajout_ml = if goutte_centree { 0.8 } else { (facteur_dose as f32) * 0.45 };
             self.volume_ml = (self.volume_ml + ajout_ml).min(260.0);
